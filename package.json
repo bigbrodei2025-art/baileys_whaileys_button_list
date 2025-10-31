@@ -1,0 +1,33 @@
+{
+  "name": "whatsapp-bot-buttons-lists",
+  "version": "1.0.0",
+  "description": "Bot WhatsApp que envia listas e botões usando whaileys",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "watch": "tsc --watch"
+  },
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "whaileys",
+    "baileys"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "whaileys": "github:canove/whaileys",
+    "@hapi/boom": "^10.0.1",
+    "pino": "^8.17.2",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}
+
