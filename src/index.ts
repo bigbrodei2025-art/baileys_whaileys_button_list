@@ -14,6 +14,7 @@ import qrcode from 'qrcode-terminal';
 import * as fs from 'fs';
 import * as path from 'path';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import OpenAI from 'openai';
 
 // Diretório para salvar a autenticação
 const authDir = path.join(__dirname, '../auth');
@@ -46,13 +47,8 @@ function loadChatHistory(remoteJid: string): any[] {
     try {
       const data = fs.readFileSync(historyFile, 'utf-8');
       const history = JSON.parse(data);
-      // Converter roles "assistant" para "model" para compatibilidade com Gemini
-      return Array.isArray(history) ? history.map((item: any) => {
-        if (item.role === 'assistant') {
-          return { ...item, role: 'model' };
-        }
-        return item;
-      }) : [];
+      // Retornar histórico sem conversão - a conversão será feita conforme o provider usado
+      return Array.isArray(history) ? history : [];
     } catch (error) {
       console.error('Erro ao carregar histórico:', error);
       return [];
@@ -73,6 +69,140 @@ function saveChatHistory(remoteJid: string, history: any[]): void {
 // Função auxiliar para aguardar um tempo
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Função para converter histórico do formato Gemini para OpenAI
+function convertHistoryForOpenAI(history: any[]): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+  return history.map((item: any) => {
+    if (item.role === 'model') {
+      return { role: 'assistant', content: item.parts?.[0]?.text || '' };
+    }
+    return { role: item.role as 'user' | 'assistant', content: item.parts?.[0]?.text || '' };
+  });
+}
+
+// Função para processar mensagem com ChatGPT
+async function processWithChatGPT(textMessage: string, remoteJid: string, retryCount: number = 0): Promise<string | null> {
+  if (!CHATGPT_ENABLED || !openaiClient) {
+    return null;
+  }
+
+  const maxRetries = 2;
+  
+  try {
+    // Carregar histórico de chat
+    let chatHistory = loadChatHistory(remoteJid);
+    
+    // Converter histórico para formato OpenAI se necessário
+    let openaiHistory: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
+    if (chatHistory.length > 0) {
+      // Verificar se está no formato Gemini (tem 'parts' ou role 'model')
+      const isGeminiFormat = chatHistory[0].parts || 
+                             chatHistory.some((item: any) => item.role === 'model');
+      
+      if (isGeminiFormat) {
+        // Formato Gemini, converter para OpenAI
+        openaiHistory = convertHistoryForOpenAI(chatHistory);
+      } else {
+        // Já está no formato OpenAI, mas garantir que não há roles 'model'
+        openaiHistory = chatHistory.map((item: any) => {
+          if (item.role === 'model') {
+            return { ...item, role: 'assistant' };
+          }
+          return item;
+        }) as OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+      }
+    }
+
+    // Adicionar mensagem do usuário ao histórico
+    openaiHistory.push({
+      role: 'user',
+      content: textMessage
+    });
+
+    // Limitar histórico a últimas 20 mensagens para evitar tokens excessivos
+    if (openaiHistory.length > 20) {
+      openaiHistory = openaiHistory.slice(-20);
+    }
+
+    // Gerar resposta com ChatGPT
+    // Modelos mais recentes (gpt-4+, gpt-5, o1) usam max_completion_tokens
+    // Modelos mais antigos (gpt-3.5-turbo) usam max_tokens
+    // Alguns modelos (gpt-5, o1) não suportam temperature customizado
+    const modelVersionMatch = CHATGPT_MODEL.match(/gpt-(\d+)/);
+    const modelVersion = modelVersionMatch ? parseInt(modelVersionMatch[1]) : 0;
+    const isNewModel = modelVersion >= 4 || CHATGPT_MODEL.includes('o1');
+    const isRestrictedModel = modelVersion >= 5 || CHATGPT_MODEL.includes('o1');
+    
+    const completionParams: any = {
+      model: CHATGPT_MODEL,
+      messages: openaiHistory,
+    };
+    
+    // Apenas adicionar temperature se o modelo suportar valores customizados
+    if (!isRestrictedModel) {
+      completionParams.temperature = 0.7;
+    }
+    
+    if (isNewModel) {
+      completionParams.max_completion_tokens = 2000;
+    } else {
+      completionParams.max_tokens = 2000;
+    }
+    
+    const completion = await openaiClient.chat.completions.create(completionParams);
+
+    const responseText = completion.choices[0]?.message?.content;
+
+    if (responseText) {
+      // Adicionar resposta do modelo ao histórico
+      openaiHistory.push({
+        role: 'assistant',
+        content: responseText
+      });
+
+      // Salvar histórico atualizado
+      saveChatHistory(remoteJid, openaiHistory);
+
+      return responseText;
+    }
+
+    return null;
+  } catch (error: any) {
+    // Tratar erro 429 (quota excedida)
+    if (error.status === 429) {
+      const retryAfter = error.headers?.['retry-after'] 
+        ? parseInt(error.headers['retry-after']) * 1000 
+        : 30000; // 30 segundos padrão
+      
+      if (retryCount < maxRetries) {
+        console.log(`⏳ Quota excedida. Aguardando ${retryAfter / 1000}s antes de tentar novamente... (tentativa ${retryCount + 1}/${maxRetries})`);
+        await wait(retryAfter);
+        return processWithChatGPT(textMessage, remoteJid, retryCount + 1);
+      } else {
+        console.error('❌ Erro ao processar com ChatGPT: Quota excedida após múltiplas tentativas');
+        return `Desculpe, atingi o limite de requisições do modelo ${CHATGPT_MODEL}. Por favor, tente novamente em alguns minutos.`;
+      }
+    }
+    
+    // Tratar outros erros
+    console.error('❌ Erro ao processar com ChatGPT:', error.message || error);
+    
+    // Mensagem amigável para erros conhecidos
+    if (error.message?.includes('quota') || error.message?.includes('Quota') || error.message?.includes('rate_limit')) {
+      return `Desculpe, o modelo ${CHATGPT_MODEL} não está disponível no seu plano atual ou a quota foi excedida. Tente novamente mais tarde.`;
+    }
+    
+    if (error.status === 404) {
+      return `Desculpe, o modelo ${CHATGPT_MODEL} não foi encontrado ou não está disponível. Verifique se o nome do modelo está correto.`;
+    }
+    
+    if (error.status === 401) {
+      return `Desculpe, a API key do ChatGPT está inválida. Verifique a configuração no arquivo .env.`;
+    }
+    
+    return null;
+  }
+}
+
 // Função para processar mensagem com Gemini
 async function processWithGemini(textMessage: string, remoteJid: string, retryCount: number = 0): Promise<string | null> {
   if (!GEMINI_ENABLED || !geminiModel) {
@@ -84,6 +214,34 @@ async function processWithGemini(textMessage: string, remoteJid: string, retryCo
   try {
     // Carregar histórico de chat
     let chatHistory = loadChatHistory(remoteJid);
+    
+    // Converter histórico para formato Gemini se necessário
+    // Se o histórico está no formato OpenAI (sem 'parts' ou com 'assistant'), converter
+    if (chatHistory.length > 0 && !chatHistory[0].parts) {
+      // Está no formato OpenAI, converter para Gemini
+      chatHistory = chatHistory.map((item: any) => {
+        const content = typeof item.content === 'string' ? item.content : '';
+        if (item.role === 'assistant') {
+          return { role: 'model', parts: [{ text: content }] };
+        }
+        return { role: item.role, parts: [{ text: content }] };
+      });
+    } else if (chatHistory.length > 0 && chatHistory.some((item: any) => item.role === 'assistant')) {
+      // Tem alguns itens no formato OpenAI, converter todos
+      chatHistory = chatHistory.map((item: any) => {
+        if (item.role === 'assistant') {
+          const content = typeof item.content === 'string' ? item.content : '';
+          return { role: 'model', parts: [{ text: content }] };
+        }
+        // Se já tem parts, manter como está
+        if (item.parts) {
+          return item;
+        }
+        // Se não tem parts mas tem content, converter
+        const content = typeof item.content === 'string' ? item.content : '';
+        return { role: item.role, parts: [{ text: content }] };
+      });
+    }
 
     // Adicionar mensagem do usuário ao histórico
     chatHistory.push({
@@ -161,6 +319,14 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
 const GEMINI_ENABLED = GEMINI_API_KEY !== '';
 
+// Configuração do ChatGPT
+const CHATGPT_API_KEY = process.env.CHATGPT_API_KEY || '';
+const CHATGPT_MODEL = process.env.CHATGPT_MODEL || 'gpt-3.5-turbo';
+const CHATGPT_ENABLED = CHATGPT_API_KEY !== '';
+
+// Escolher qual provider usar (gemini ou chatgpt)
+const AI_PROVIDER = (process.env.AI_PROVIDER || 'gemini').toLowerCase();
+
 // Inicializar Gemini se a API key estiver configurada
 let genAI: GoogleGenerativeAI | null = null;
 let geminiModel: any = null;
@@ -176,6 +342,23 @@ if (GEMINI_ENABLED) {
 } else {
   console.log('⚠️  Gemini AI não configurado. Configure GEMINI_API_KEY para habilitar.');
 }
+
+// Inicializar ChatGPT se a API key estiver configurada
+let openaiClient: OpenAI | null = null;
+
+if (CHATGPT_ENABLED) {
+  try {
+    openaiClient = new OpenAI({ apiKey: CHATGPT_API_KEY });
+    console.log('✅ ChatGPT inicializado com sucesso!');
+  } catch (error) {
+    console.error('❌ Erro ao inicializar ChatGPT:', error);
+  }
+} else {
+  console.log('⚠️  ChatGPT não configurado. Configure CHATGPT_API_KEY para habilitar.');
+}
+
+// Verificar qual provider está ativo
+const AI_ENABLED = (AI_PROVIDER === 'gemini' && GEMINI_ENABLED) || (AI_PROVIDER === 'chatgpt' && CHATGPT_ENABLED);
 
 // Função para processar mensagens recebidas
 async function handleMessage(msg: proto.IWebMessageInfo) {
@@ -214,7 +397,8 @@ async function handleMessage(msg: proto.IWebMessageInfo) {
     if (msg.key.fromMe) return;
 
     // Log de debug para mensagens recebidas
-    console.log(`📨 Mensagem recebida: "${textMessage}" | Gemini habilitado: ${GEMINI_ENABLED}`);
+    const providerName = AI_PROVIDER === 'chatgpt' ? 'ChatGPT' : 'Gemini';
+    console.log(`📨 Mensagem recebida: "${textMessage}" | Provider: ${providerName} | Habilitado: ${AI_ENABLED}`);
 
     // Comando !list - Enviar mensagem com lista (sections)
     if (command === '!list') {
@@ -300,7 +484,7 @@ async function handleMessage(msg: proto.IWebMessageInfo) {
       return;
     }
 
-    // Comando !clearchat - Limpar histórico de chat do Gemini
+    // Comando !clearchat - Limpar histórico de chat
     if (command === '!clearchat') {
       const historyFile = getChatHistoryFile(msg.key.remoteJid);
       if (fs.existsSync(historyFile)) {
@@ -317,9 +501,9 @@ async function handleMessage(msg: proto.IWebMessageInfo) {
       return;
     }
 
-    // Resposta automática com Gemini (apenas se houver texto na mensagem e Gemini estiver habilitado)
-    if (GEMINI_ENABLED && textMessage.trim() !== '') {
-      console.log('🤖 Processando mensagem com Gemini...');
+    // Resposta automática com IA (apenas se houver texto na mensagem e IA estiver habilitada)
+    if (AI_ENABLED && textMessage.trim() !== '') {
+      console.log(`🤖 Processando mensagem com ${providerName}...`);
       // Mostrar indicador de digitação
       try {
         await sock.sendPresenceUpdate('composing', msg.key.remoteJid);
@@ -327,24 +511,29 @@ async function handleMessage(msg: proto.IWebMessageInfo) {
         console.log('⚠️  Erro ao enviar presence update (pode ser normal):', error);
       }
 
-      // Processar mensagem com Gemini
-      const geminiResponse = await processWithGemini(textMessage, msg.key.remoteJid);
+      // Processar mensagem com o provider selecionado
+      let aiResponse: string | null = null;
+      if (AI_PROVIDER === 'chatgpt') {
+        aiResponse = await processWithChatGPT(textMessage, msg.key.remoteJid);
+      } else {
+        aiResponse = await processWithGemini(textMessage, msg.key.remoteJid);
+      }
 
-      if (geminiResponse) {
+      if (aiResponse) {
         await sock.sendMessage(msg.key.remoteJid, {
-          text: geminiResponse
+          text: aiResponse
         });
         // Verificar se é uma mensagem de erro (começa com "Desculpe")
-        if (geminiResponse.startsWith('Desculpe')) {
+        if (aiResponse.startsWith('Desculpe')) {
           console.log('⚠️  Mensagem de erro/enquota enviada ao usuário');
         } else {
-          console.log('✅ Resposta do Gemini enviada!');
+          console.log(`✅ Resposta do ${providerName} enviada!`);
         }
       } else {
         await sock.sendMessage(msg.key.remoteJid, {
           text: 'Desculpe, não consegui processar sua mensagem no momento. Tente novamente mais tarde.'
         });
-        console.log('⚠️  Gemini não retornou resposta');
+        console.log(`⚠️  ${providerName} não retornou resposta`);
       }
 
       // Parar indicador de digitação
@@ -353,8 +542,11 @@ async function handleMessage(msg: proto.IWebMessageInfo) {
       } catch (error) {
         // Ignorar erro de presence update
       }
-    } else if (!GEMINI_ENABLED && textMessage.trim() !== '') {
-      console.log('ℹ️  Mensagem recebida mas Gemini não está configurado. Configure GEMINI_API_KEY no arquivo .env');
+    } else if (!AI_ENABLED && textMessage.trim() !== '') {
+      const providerConfig = AI_PROVIDER === 'chatgpt' 
+        ? 'CHATGPT_API_KEY' 
+        : 'GEMINI_API_KEY';
+      console.log(`ℹ️  Mensagem recebida mas ${providerName} não está configurado. Configure ${providerConfig} no arquivo .env`);
     }
   } catch (error) {
     console.error('❌ Erro ao enviar mensagem:', error);
@@ -418,17 +610,31 @@ async function startSocket() {
         console.log('   • !list      - Envia lista interativa');
         console.log('   • !button    - Envia botões interativos');
         console.log('   • !buttonimg - Envia botões com imagem');
-        console.log('   • !clearchat - Limpa histórico de chat do Gemini');
-        console.log('\n🤖 Status do Gemini AI:');
+        console.log('   • !clearchat - Limpa histórico de chat');
+        console.log('\n🤖 Status da IA:');
+        console.log(`   Provider selecionado: ${AI_PROVIDER.toUpperCase()}`);
+        console.log('\n   📊 Gemini AI:');
         if (GEMINI_ENABLED) {
-          console.log('   ✅ HABILITADO - O bot responderá automaticamente às mensagens');
+          console.log(`   ✅ HABILITADO (Modelo: ${GEMINI_MODEL})`);
         } else {
           console.log('   ❌ DESABILITADO');
-          console.log('   📝 Para habilitar:');
-          console.log('      1. Crie um arquivo .env na raiz do projeto');
-          console.log('      2. Adicione: GEMINI_API_KEY=sua_api_key_aqui');
-          console.log('      3. Reinicie o bot');
+          console.log('   📝 Para habilitar: Configure GEMINI_API_KEY no .env');
           console.log('   🔗 Obtenha sua API key em: https://makersuite.google.com/app/apikey');
+        }
+        console.log('\n   📊 ChatGPT:');
+        if (CHATGPT_ENABLED) {
+          console.log(`   ✅ HABILITADO (Modelo: ${CHATGPT_MODEL})`);
+        } else {
+          console.log('   ❌ DESABILITADO');
+          console.log('   📝 Para habilitar: Configure CHATGPT_API_KEY no .env');
+          console.log('   🔗 Obtenha sua API key em: https://platform.openai.com/api-keys');
+        }
+        if (AI_ENABLED) {
+          console.log(`\n   ✅ IA ATIVA - O bot responderá automaticamente usando ${AI_PROVIDER.toUpperCase()}`);
+        } else {
+          console.log('\n   ⚠️  NENHUMA IA HABILITADA');
+          console.log('   📝 Configure pelo menos uma API key no arquivo .env');
+          console.log('   📝 Use AI_PROVIDER=gemini ou AI_PROVIDER=chatgpt para escolher');
         }
         console.log('\n💬 Aguardando mensagens...\n');
       }
