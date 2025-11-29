@@ -32,7 +32,7 @@ npm install
    
    ```env
    GEMINI_API_KEY=sua_api_key_aqui
-   GEMINI_MODEL=gemini-1.5-flash
+   GEMINI_MODEL=gemini-2.0-flash
    ```
    
    Para obter uma API key do Gemini:
